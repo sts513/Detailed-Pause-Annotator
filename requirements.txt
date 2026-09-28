@@ -1,0 +1,4 @@
+praat-parselmouth>=0.4.3
+numpy
+scipy
+tgt
