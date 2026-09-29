@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Pause Annotator
-===============
+Detailed Pause Annotator
+========================
 Semi-automated annotation of the internal structure of speech pauses.
 
     Step 1  PauseDetect    Segments each sound file into IPUs and pauses.
@@ -22,9 +22,8 @@ All settings are described in README.md.
 
 import bisect
 import math
-import os
 import queue
-import subprocess
+import re
 import sys
 import threading
 from dataclasses import dataclass
@@ -36,7 +35,7 @@ import tgt
 from parselmouth.praat import call
 from scipy.signal import butter, sosfilt
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Fixed names
@@ -77,12 +76,12 @@ STEP1_PARAMS = [
     Param("threshold_db", "Silence threshold (dB below peak)", 30.0),
     Param("min_silence", "Minimum pause duration (s)", 0.2),
     Param("min_sounding", "Minimum IPU duration (s)", 0.1),
-    Param("use_filter", "Band-pass filter before intensity analysis", True, "bool"),
     Param("burst_correction", "Move short bursts before speech onset into the pause", True, "bool"),
     Param("ghost_filter", "Relabel IPUs without voicing as pauses", True, "bool"),
     # advanced
-    Param("filter_low", "Band-pass low cut-off (Hz)", 80.0, advanced=True, group="Filter and intensity"),
-    Param("filter_high", "Band-pass high cut-off (Hz)", 8000.0, advanced=True, group="Filter and intensity"),
+    Param("filter_low", "Band-pass low cut-off (Hz, 0 = none)", 80.0, advanced=True, group="Filter and intensity"),
+    Param("filter_high", "Band-pass high cut-off (Hz, 0 = none)", 8000.0, advanced=True, group="Filter and intensity"),
+    Param("filter_smooth", "Hann smoothing (Hz)", 80.0, advanced=True, group="Filter and intensity"),
     Param("intensity_min_pitch", "Intensity minimum pitch (Hz)", 100.0, advanced=True, group="Filter and intensity"),
     Param("time_step", "Intensity time step (s, 0 = auto)", 0.008, advanced=True, group="Filter and intensity"),
     Param("burst_max_dur", "Maximum burst duration (s)", 0.060, advanced=True, group="Burst correction"),
@@ -248,20 +247,6 @@ def pause_segments_from_tier(tier, pause_label, start, end):
 # Step 1 – PauseDetect
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def spectral_bandpass(sound, low_hz, high_hz):
-    """Brick-wall band-pass in the frequency domain (keeps the sound's length)."""
-    spectrum = sound.to_spectrum()
-    freqs = spectrum.xs()
-    values = spectrum.values.copy()
-    values[:, (freqs < low_hz) | (freqs > high_hz)] = 0.0
-    spectrum.values[:] = values
-    return spectrum.to_sound().extract_part(
-        from_time=sound.start_time, to_time=sound.end_time,
-        window_shape=parselmouth.WindowShape.RECTANGULAR,
-        relative_width=1.0, preserve_times=True,
-    )
-
-
 def find_onset_bursts(segments, times, values, threshold, p):
     """Short energy bursts near the start of an IPU that are followed by a
     drop in energy (typically clicks right before speech onset).
@@ -374,19 +359,28 @@ def apply_voicing_check(sound, segments, p):
 def run_pause_detection(sound, p):
     """Step 1. Returns segments labelled 'ipu' / 'pause' covering the sound.
 
-    The segmentation itself is done by Praat's own "To TextGrid (silences)"
-    command, so with the three extra stages switched off the result is
-    identical to Praat's silences annotator.
+    This reproduces Praat's "Sound: To TextGrid (silences)", with the
+    band-pass filter exposed as a setting: the sound is filtered with a Hann
+    band-pass (Praat uses 80-8000 Hz with 80 Hz smoothing), intensity is
+    computed with the mean subtracted, and Praat's "Intensity: To TextGrid
+    (silences)" finds the pauses. With the default filter, the result is
+    identical to Praat's silences annotator. The burst correction works on
+    the very same intensity contour, so its bursts line up exactly with the
+    pause boundaries.
     """
-    if p["use_filter"]:
-        work = filter_in_chunks(sound, lambda s: spectral_bandpass(s, p["filter_low"], p["filter_high"]))
+    low, high = p["filter_low"], p["filter_high"]
+    if low > 0 or high > 0:
+        work = filter_in_chunks(sound, lambda s: call(s, "Filter (pass Hann band)", low, high, p["filter_smooth"]))
     else:
         work = sound
     try:
-        grid = call(work, "To TextGrid (silences)", p["intensity_min_pitch"], p["time_step"],
-                    -abs(p["threshold_db"]), p["min_silence"], p["min_sounding"], LABEL_PAUSE, LABEL_IPU)
+        intensity = work.to_intensity(minimum_pitch=p["intensity_min_pitch"],
+                                      time_step=p["time_step"] or None, subtract_mean=True)
+        grid = call(intensity, "To TextGrid (silences)", -abs(p["threshold_db"]),
+                    p["min_silence"], p["min_sounding"], LABEL_PAUSE, LABEL_IPU)
     except parselmouth.PraatError as e:
         raise StepError(f"silence detection failed ({str(e).splitlines()[0]})")
+
     segments = []
     for i in range(1, call(grid, "Get number of intervals", 1) + 1):
         segments.append({"start": call(grid, "Get start time of interval", 1, i),
@@ -394,15 +388,12 @@ def run_pause_detection(sound, p):
                          "label": call(grid, "Get label of interval", 1, i)})
 
     if p["burst_correction"] and any(s["label"] == LABEL_PAUSE for s in segments):
-        # Same intensity analysis as Praat's silences annotator uses.
-        intensity = work.to_intensity(minimum_pitch=p["intensity_min_pitch"],
-                                      time_step=p["time_step"] or None, subtract_mean=False)
         times = intensity.xs()
         values = intensity.values[0].copy()
         threshold = call(intensity, "Get maximum", 0, 0, "Parabolic") - abs(p["threshold_db"])
         if len(times):
             bursts = find_onset_bursts(segments, times, values, threshold, p)
-            segments = apply_burst_correction(segments, bursts, tolerance=intensity.dx + 1e-6)
+            segments = apply_burst_correction(segments, bursts)
 
     if p["ghost_filter"]:
         segments = apply_voicing_check(sound, segments, p)
@@ -719,21 +710,164 @@ def run_batch(files, settings, messages, stop_event):
 # GUI
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def open_readme():
-    from tkinter import messagebox
-    path = Path(__file__).resolve().with_name("README.md")
-    if not path.exists():
-        messagebox.showinfo("Help", "README.md was not found next to pause_annotator.py.")
-        return
-    try:
-        if sys.platform.startswith("win"):
-            os.startfile(str(path))
-        elif sys.platform == "darwin":
-            subprocess.run(["open", str(path)], check=False)
+PROGRAM_NAME = "Detailed Pause Annotator"
+
+_INLINE = re.compile(r"(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\)|https?://[^\s)]+|\*[^*\s][^*]*\*)")
+
+
+class HelpWindow:
+    """Shows README.md inside the program, with simple Markdown formatting."""
+
+    _current = None
+
+    @classmethod
+    def show(cls, root):
+        if cls._current is not None and cls._current.window.winfo_exists():
+            cls._current.window.deiconify()
+            cls._current.window.lift()
+            return
+        cls._current = cls(root)
+
+    def __init__(self, root):
+        import tkinter as tk
+        import tkinter.font as tkfont
+        from tkinter import ttk
+
+        self.window = tk.Toplevel(root)
+        self.window.title(f"Help – {PROGRAM_NAME}")
+        self.window.geometry("820x720")
+
+        frame = ttk.Frame(self.window, padding=(10, 10, 10, 0))
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self.text = tk.Text(frame, wrap="word", padx=16, pady=12, relief="flat",
+                            background="white", foreground="black", cursor="arrow")
+        self.text.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(frame, command=self.text.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.text.configure(yscrollcommand=scroll.set)
+        ttk.Button(self.window, text="Close", command=self.window.destroy).pack(anchor="e", padx=10, pady=10)
+
+        base = tkfont.nametofont("TkDefaultFont").actual()
+        family, size = base["family"], abs(base["size"]) or 10
+        mono = tkfont.nametofont("TkFixedFont").actual()["family"]
+        t = self.text
+        t.configure(font=(family, size + 1), spacing1=2, spacing3=2)
+        t.tag_configure("h1", font=(family, size + 9, "bold"), spacing1=6, spacing3=10)
+        t.tag_configure("h2", font=(family, size + 5, "bold"), spacing1=16, spacing3=6)
+        t.tag_configure("h3", font=(family, size + 3, "bold"), spacing1=12, spacing3=4)
+        t.tag_configure("bold", font=(family, size + 1, "bold"))
+        t.tag_configure("italic", font=(family, size + 1, "italic"))
+        t.tag_configure("code", font=(mono, size), background="#f0f0f0")
+        t.tag_configure("codeblock", font=(mono, size), background="#f0f0f0",
+                        lmargin1=16, lmargin2=16, spacing1=0, spacing3=0)
+        t.tag_configure("item", lmargin1=12, lmargin2=30, spacing1=3)
+        t.tag_configure("link", foreground="#1a5fb4", underline=True)
+        t.tag_bind("link", "<Enter>", lambda e: t.configure(cursor="hand2"))
+        t.tag_bind("link", "<Leave>", lambda e: t.configure(cursor="arrow"))
+        self._link_count = 0
+
+        path = Path(__file__).resolve().with_name("README.md")
+        if path.exists():
+            self.render(path.read_text(encoding="utf-8"))
         else:
-            subprocess.run(["xdg-open", str(path)], check=False)
-    except OSError:
-        messagebox.showinfo("Help", f"Please open this file manually:\n{path}")
+            t.insert("end", "README.md was not found next to pause_annotator.py.\n\n"
+                            "It is part of the download on GitHub; please place it in the same "
+                            "folder as the program.")
+        t.configure(state="disabled")
+
+    # ── Markdown rendering (headings, lists, tables, code, bold, italics, links) ──
+    def inline(self, line, extra=()):
+        pos = 0
+        for m in _INLINE.finditer(line):
+            if m.start() > pos:
+                self.text.insert("end", line[pos:m.start()], extra)
+            token = m.group(0)
+            if token.startswith("**"):
+                self.text.insert("end", token[2:-2], ("bold",) + tuple(extra))
+            elif token.startswith("`"):
+                self.text.insert("end", token[1:-1], ("code",) + tuple(extra))
+            elif token.startswith("["):
+                label, url = token[1:].split("](", 1)
+                self.insert_link(label, url[:-1], extra)
+            elif token.startswith("http"):
+                self.insert_link(token, token, extra)
+            else:
+                self.text.insert("end", token[1:-1], ("italic",) + tuple(extra))
+            pos = m.end()
+        self.text.insert("end", line[pos:], extra)
+
+    def insert_link(self, label, url, extra):
+        import webbrowser
+        self._link_count += 1
+        tag = f"link{self._link_count}"
+        self.text.tag_bind(tag, "<Button-1>", lambda e, u=url: webbrowser.open(u))
+        self.text.insert("end", label, ("link", tag) + tuple(extra))
+
+    def table(self, rows):
+        cells = [[c.strip() for c in r.strip().strip("|").split("|")] for r in rows]
+        body = [r for r in cells[1:] if not all(set(c) <= set("-: ") for c in r)]
+        for row in body:
+            self.text.insert("end", "•  ", "item")
+            self.inline(row[0], ("bold", "item") if not row[0].startswith("`") else ("item",))
+            rest = [c for c in row[1:] if c and c != "–"]
+            if rest:
+                self.text.insert("end", ": ", "item")
+                self.inline(" – ".join(rest), ("item",))
+            self.text.insert("end", "\n", "item")
+        self.text.insert("end", "\n")
+
+    def render(self, markdown):
+        lines = markdown.splitlines()
+        previous = None          # kind of the last block, to add space after lists
+
+        def gap_after_list():
+            if previous == "list":
+                self.text.insert("end", "\n")
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                gap_after_list()
+                i += 1
+                while i < len(lines) and not lines[i].strip().startswith("```"):
+                    self.text.insert("end", lines[i] + "\n", "codeblock")
+                    i += 1
+                self.text.insert("end", "\n")
+                previous = "code"
+            elif stripped.startswith("[!["):
+                pass  # badge images cannot be shown here
+            elif stripped.startswith("|"):
+                gap_after_list()
+                rows = []
+                while i < len(lines) and lines[i].strip().startswith("|"):
+                    rows.append(lines[i])
+                    i += 1
+                self.table(rows)
+                previous = "table"
+                continue
+            elif stripped.startswith("#"):
+                level = len(stripped) - len(stripped.lstrip("#"))
+                self.text.insert("end", stripped[level:].strip() + "\n", f"h{min(level, 3)}")
+                previous = "heading"
+            elif re.match(r"^[*-] ", stripped) or re.match(r"^\d+\. ", stripped):
+                if stripped[0] in "*-":
+                    marker, rest = "•", stripped[2:]
+                else:
+                    marker, rest = stripped.split(" ", 1)
+                self.text.insert("end", marker + "  ", "item")
+                self.inline(rest, ("item",))
+                self.text.insert("end", "\n", "item")
+                previous = "list"
+            elif stripped:
+                gap_after_list()
+                self.inline(stripped)
+                self.text.insert("end", "\n\n")
+                previous = "paragraph"
+            i += 1
 
 
 class ParamPanel:
@@ -824,13 +958,83 @@ class ParamPanel:
                 w.state(["!disabled"] if enabled else ["disabled"])
 
 
+class ScrollableFrame:
+    """A frame with a vertical scrollbar that appears only when needed.
+
+    Widgets go into .inner; .outer is placed in the layout.
+    """
+
+    def __init__(self, parent, padding=10):
+        import tkinter as tk
+        from tkinter import ttk
+        self.outer = ttk.Frame(parent)
+        self.outer.rowconfigure(0, weight=1)
+        self.outer.columnconfigure(0, weight=1)
+        background = ttk.Style().lookup("TFrame", "background") or None
+        self.canvas = tk.Canvas(self.outer, highlightthickness=0, borderwidth=0, height=200)
+        if background:
+            self.canvas.configure(background=background)
+        self.vbar = ttk.Scrollbar(self.outer, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vbar.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.vbar.grid(row=0, column=1, sticky="ns")
+        self.inner = ttk.Frame(self.canvas, padding=padding)
+        self.item = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+
+        self.inner.bind("<Configure>", lambda e: self._update())
+        self.canvas.bind("<Configure>", lambda e: self._update())
+        self.canvas.bind("<Enter>", lambda e: self._bind_wheel(True))
+        self.canvas.bind("<Leave>", lambda e: self._bind_wheel(False))
+
+    def _update(self):
+        req_w, req_h = self.inner.winfo_reqwidth(), self.inner.winfo_reqheight()
+        self.canvas.configure(width=req_w, scrollregion=(0, 0, req_w, req_h))
+        self.canvas.itemconfigure(self.item, width=max(req_w, self.canvas.winfo_width()))
+        if req_h <= self.canvas.winfo_height():
+            self.canvas.yview_moveto(0)
+            self.vbar.grid_remove()
+        else:
+            self.vbar.grid()
+
+    def needs_scrolling(self):
+        return self.inner.winfo_reqheight() > self.canvas.winfo_height()
+
+    def _bind_wheel(self, active):
+        if active:
+            self.canvas.bind_all("<MouseWheel>", self._on_wheel)
+            self.canvas.bind_all("<Button-4>", self._on_wheel)
+            self.canvas.bind_all("<Button-5>", self._on_wheel)
+        else:
+            for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                self.canvas.unbind_all(sequence)
+
+    def _on_wheel(self, event):
+        if not self.needs_scrolling():
+            return
+        if getattr(event, "num", None) == 4:
+            units = -1
+        elif getattr(event, "num", None) == 5:
+            units = 1
+        elif sys.platform == "darwin":
+            units = -event.delta
+        else:
+            units = -int(event.delta / 120) or (-1 if event.delta > 0 else 1)
+        self.canvas.yview_scroll(units, "units")
+
+    def scroll_to(self, widget):
+        """Scroll so that widget is at the top of the visible area, if possible."""
+        self.canvas.update_idletasks()
+        total = max(1, self.inner.winfo_reqheight())
+        self.canvas.yview_moveto(widget.winfo_y() / total)
+
+
 class App:
     def __init__(self, root):
         import tkinter as tk
         from tkinter import ttk
         self.tk, self.ttk = tk, ttk
         self.root = root
-        root.title(f"Pause Annotator {__version__}")
+        root.title(f"{PROGRAM_NAME} {__version__}")
         root.minsize(760, 560)
 
         self.messages = queue.Queue()
@@ -863,9 +1067,15 @@ class App:
             ("run2", "step2", "Step 2: Breaths", "Run Step 2 (breath detection)", STEP2_PARAMS),
             ("run3", "step3", "Step 3: Clicks", "Run Step 3 (click detection)", STEP3_PARAMS),
         ]
+        self.scrollers = []
         for run_key, step_key, title, check_text, params in tab_specs:
-            tab = ttk.Frame(notebook, padding=10)
-            notebook.add(tab, text=title)
+            page = ttk.Frame(notebook)
+            notebook.add(page, text=title)
+            scroller = ScrollableFrame(page)
+            scroller.outer.pack(fill="both", expand=True)
+            self.scrollers.append(scroller)
+            tab = scroller.inner
+
             run_var = tk.BooleanVar(value=True)
             self.run_vars[run_key] = run_var
             ttk.Checkbutton(tab, text=check_text, variable=run_var,
@@ -876,11 +1086,18 @@ class App:
             adv_toggle = ttk.Button(tab, text="Show advanced settings")
             adv_toggle.grid(row=3, column=0, sticky="w", pady=(12, 6))
             adv = ttk.Frame(tab)
-            adv_toggle.configure(command=lambda f=adv, b=adv_toggle: self.toggle_advanced(f, b))
+            adv_toggle.configure(command=lambda f=adv, b=adv_toggle, sc=scroller:
+                                 self.toggle_advanced(f, b, sc))
             self.panels[step_key] = ParamPanel(basic, params, adv)
 
             if step_key == "step1":
                 self.build_existing_frame(tab)
+
+        # The visible area fits the basic settings; advanced settings scroll.
+        root.update_idletasks()
+        self.basic_height = max(sc.inner.winfo_reqheight() for sc in self.scrollers)
+        for sc in self.scrollers:
+            sc.canvas.configure(height=self.basic_height)
 
         # ── Progress and log ──────────────────────────────────────────────────
         self.progress = ttk.Progressbar(main, mode="determinate", maximum=100)
@@ -900,7 +1117,7 @@ class App:
         # ── Buttons ───────────────────────────────────────────────────────────
         buttons = ttk.Frame(main)
         buttons.grid(row=6, column=0, columnspan=3, sticky="ew")
-        ttk.Button(buttons, text="Help", command=open_readme).pack(side="left")
+        ttk.Button(buttons, text="Help", command=lambda: HelpWindow.show(root)).pack(side="left")
         ttk.Button(buttons, text="Restore defaults", command=self.restore_defaults).pack(side="left", padx=6)
         self.stop_button = ttk.Button(buttons, text="Stop", command=self.stop, state="disabled")
         self.stop_button.pack(side="right")
@@ -931,13 +1148,21 @@ class App:
         self.tg_button = ttk.Button(box, text="Browse…", command=self.browse_textgrids)
         self.tg_button.grid(row=3, column=2, padx=(6, 0))
 
-    def toggle_advanced(self, frame, button):
-        if frame.winfo_ismapped():
+    def toggle_advanced(self, frame, button, scroller):
+        if frame.grid_info():
             frame.grid_remove()
             button.configure(text="Show advanced settings")
+            scroller.canvas.configure(height=self.basic_height)
         else:
             frame.grid(row=4, column=0, columnspan=2, sticky="nw")
             button.configure(text="Hide advanced settings")
+            # Grow the settings area as far as the screen allows; scroll the rest.
+            self.root.update_idletasks()
+            other = self.root.winfo_height() - scroller.canvas.winfo_height()
+            available = self.root.winfo_screenheight() - other - 120
+            wanted = scroller.inner.winfo_reqheight()
+            scroller.canvas.configure(height=max(self.basic_height, min(wanted, available)))
+            scroller.scroll_to(button)
 
     def update_states(self):
         run1 = self.run_vars["run1"].get()
@@ -993,8 +1218,11 @@ class App:
 
         if not errors:
             s1, s2, s3 = settings["step1"], settings["step2"], settings["step3"]
-            if settings["run1"] and s1["use_filter"] and s1["filter_low"] >= s1["filter_high"]:
-                errors.append("Step 1: the low cut-off must be below the high cut-off.")
+            if settings["run1"]:
+                if s1["filter_low"] < 0 or s1["filter_high"] < 0 or s1["filter_smooth"] < 0:
+                    errors.append("Step 1: filter frequencies cannot be negative.")
+                elif s1["filter_high"] > 0 and s1["filter_low"] >= s1["filter_high"]:
+                    errors.append("Step 1: the low cut-off must be below the high cut-off.")
             if settings["run2"]:
                 if s2["band_low"] >= s2["band_high"]:
                     errors.append("Step 2: the low cut-off must be below the high cut-off.")
